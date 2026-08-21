@@ -706,6 +706,26 @@ class TestAnthropicOAuthFlag:
         assert model == "claude-haiku-4-5-20251001"
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
+    def test_empty_pool_entry_falls_back_to_standalone_token(self):
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, {})),
+            patch(
+                "agent.anthropic_adapter.resolve_anthropic_token",
+                return_value="standalone-api-key",
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(),
+            ) as mock_build,
+        ):
+            from agent.auxiliary_client import _try_anthropic
+
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model == "claude-haiku-4-5-20251001"
+        assert mock_build.call_args.args[0] == "standalone-api-key"
+
 
 class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
