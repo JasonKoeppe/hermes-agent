@@ -506,6 +506,142 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
+def collect_compression_routes(config: dict | None) -> list[dict]:
+    """Return configured compression routes in failover order.
+
+    The returned dictionaries are fresh copies.  Callers must render only the
+    source/provider/model fields because legacy route entries may contain an
+    inline ``api_key``.
+    """
+    config = config if isinstance(config, dict) else {}
+    model_cfg = config.get("model")
+    model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+    main_provider = str(model_cfg.get("provider") or "auto").strip() or "auto"
+    main_model = str(
+        model_cfg.get("default") or model_cfg.get("model") or ""
+    ).strip()
+    auxiliary = config.get("auxiliary")
+    auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+    compression = auxiliary.get("compression")
+    compression = compression if isinstance(compression, dict) else {}
+
+    def _route(entry: dict, source: str, *, default_provider: str = "") -> dict:
+        route = dict(entry)
+        provider = str(route.get("provider") or default_provider or "auto").strip()
+        if provider == "main":
+            provider = main_provider
+        route["source"] = source
+        route["provider"] = provider
+        route["model"] = str(route.get("model") or "").strip()
+        return route
+
+    primary = _route(
+        compression,
+        "primary",
+        default_provider=main_provider,
+    )
+    if not primary["model"]:
+        primary["model"] = main_model
+    routes = [primary]
+
+    task_chain = compression.get("fallback_chain")
+    if isinstance(task_chain, list):
+        for index, entry in enumerate(task_chain, 1):
+            if isinstance(entry, dict) and str(entry.get("provider") or "").strip():
+                routes.append(_route(entry, f"task fallback {index}"))
+
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    for index, entry in enumerate(get_fallback_chain(config), 1):
+        routes.append(_route(entry, f"global fallback {index}"))
+
+    return routes
+
+
+def evaluate_compression_route_health(
+    routes: list[dict], *, credential_available
+) -> dict:
+    """Classify routes with a deterministic, injected credential predicate."""
+    usable_routes = []
+    unusable_routes = []
+    for route in routes:
+        try:
+            usable = bool(credential_available(route))
+        except Exception:
+            usable = False
+        (usable_routes if usable else unusable_routes).append(route)
+    return {
+        "usable": bool(usable_routes),
+        "usable_routes": usable_routes,
+        "unusable_routes": unusable_routes,
+    }
+
+
+def _compression_route_label(route: dict) -> str:
+    provider = str(route.get("provider") or "auto").strip() or "auto"
+    model = str(route.get("model") or "default").strip() or "default"
+    return f"{route.get('source', 'route')}: {provider}/{model}"
+
+
+def format_compression_route_health(health: dict) -> str:
+    """Format route health without including URLs, keys, or credential data."""
+    routes = list(health.get("usable_routes") or []) + list(
+        health.get("unusable_routes") or []
+    )
+    labels = ", ".join(_compression_route_label(route) for route in routes)
+    if health.get("usable"):
+        return f"at least one route has locally resolvable credentials ({labels})"
+    return f"no locally resolvable credentials across configured routes ({labels})"
+
+
+def compression_route_has_local_credentials(route: dict) -> bool:
+    """Return whether a route can resolve credentials without an API call."""
+    if str(route.get("api_key") or "").strip():
+        return True
+    provider = str(route.get("provider") or "auto").strip().lower()
+    if provider == "openai-codex":
+        from agent.auxiliary_client import _read_codex_access_token
+
+        return bool(_read_codex_access_token())
+    if provider in {"", "auto"}:
+        # Auto has no single credential identity. The route collector resolves
+        # the normal compression primary to model.provider when configured;
+        # an unresolved auto route cannot be certified healthy offline.
+        return False
+    try:
+        from hermes_cli.auth import (
+            PROVIDER_REGISTRY,
+            get_api_key_provider_status,
+            get_external_process_provider_status,
+        )
+
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        auth_type = getattr(pconfig, "auth_type", "") if pconfig else ""
+        if auth_type == "api_key":
+            status = get_api_key_provider_status(provider) or {}
+        elif auth_type == "external_process":
+            status = get_external_process_provider_status(provider) or {}
+        else:
+            # OAuth/SDK resolvers can refresh or contact metadata services.
+            # Doctor's compression check is deliberately local-only.
+            from agent.credential_pool import load_pool
+
+            pool = load_pool(provider)
+            if pool and pool.has_credentials():
+                return True
+            from hermes_cli.auth import get_provider_auth_state
+
+            state = get_provider_auth_state(provider) or {}
+            return bool(
+                state.get("access_token")
+                or state.get("refresh_token")
+                or state.get("api_key")
+            )
+        return bool(status.get("configured") or status.get("logged_in"))
+    except Exception:
+        return False
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -1478,6 +1614,33 @@ def run_doctor(args):
                         )
                 except Exception:
                     pass
+
+            # Compression has its own provider/fallback chain and can be
+            # broken even while the main chat route is healthy.  This is a
+            # local credential-resolution check only: no inference request,
+            # OAuth refresh, or credential value is emitted.
+            try:
+                compression_health = evaluate_compression_route_health(
+                    collect_compression_routes(cfg),
+                    credential_available=compression_route_has_local_credentials,
+                )
+                compression_detail = format_compression_route_health(
+                    compression_health
+                )
+                if compression_health["usable"]:
+                    check_ok("Compression routes", f"({compression_detail})")
+                else:
+                    check_warn("Compression routes unusable", f"({compression_detail})")
+                    issues.append(
+                        "All configured compression routes lack locally "
+                        "resolvable credentials — configure "
+                        "auxiliary.compression or one of its fallbacks"
+                    )
+            except Exception as compression_health_error:
+                check_warn(
+                    "Could not evaluate compression route health",
+                    f"({compression_health_error})",
+                )
 
         except Exception as e:
             check_warn("Could not validate model/provider config", f"({e})")

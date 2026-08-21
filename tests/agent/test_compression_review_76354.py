@@ -23,6 +23,7 @@ import concurrent.futures
 import logging
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -457,37 +458,49 @@ class TestF6ExecutorSaturation:
 
 
 class TestS3IdleChargedFromLastProgress:
-    def test_silence_cannot_approach_double_idle_timeout(self):
-        """Progress early in an interval must not extend silence to ~2x idle."""
+    def test_silence_cannot_approach_double_idle_timeout(self, monkeypatch):
+        """The future wait is charged only the idle budget still remaining."""
         _drain_admission_slots()
         idle = 0.4
-        release = threading.Event()
+        requested_waits = []
 
-        def worker(fence: CompressionCommitFence):
-            time.sleep(0.05)
-            fence.touch_progress()  # early progress, then total silence
-            assert release.wait(timeout=10)
-            return ([], "late")
+        class _TimeoutFuture:
+            def add_done_callback(self, callback):
+                callback(self)
 
-        t0 = time.monotonic()
-        try:
-            msgs, prompt = run_compress_context_with_progress_timeout(
-                worker=worker,
-                messages=[{"role": "user", "content": "a"}],
-                system_prompt_fallback="fb",
-                idle_timeout_seconds=idle,
-                total_ceiling_seconds=5.0,
-            )
-        finally:
-            elapsed = time.monotonic() - t0
-            release.set()
-        assert prompt == "fb"
-        # Old behavior waited a full interval from the CHECK (~2x idle ≈
-        # 0.85s+). New behavior times out ~idle after the last progress
-        # (~0.45s). Allow generous slack while still excluding ~2x.
-        assert elapsed < idle * 1.8, (
-            f"silence exceeded ~2x idle budget shape: {elapsed:.2f}s"
+            def result(self, timeout=None):
+                requested_waits.append(timeout)
+                raise concurrent.futures.TimeoutError
+
+            def cancel(self):
+                return True
+
+        class _Executor:
+            def submit(self, *_args, **_kwargs):
+                return _TimeoutFuture()
+
+        fence = CompressionCommitFence()
+        # Progress occurred 350ms ago in a 400ms idle window. The first wait
+        # may therefore charge only the remaining ~50ms, not a fresh 400ms.
+        monkeypatch.setattr(
+            fence,
+            "seconds_since_progress",
+            MagicMock(side_effect=[0.35, 0.41, 0.41]),
         )
+        monkeypatch.setattr(cc, "_get_compress_timeout_executor", _Executor)
+
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: pytest.fail("fake future must not run worker"),
+            messages=[{"role": "user", "content": "a"}],
+            system_prompt_fallback="fb",
+            idle_timeout_seconds=idle,
+            total_ceiling_seconds=5.0,
+            fence=fence,
+        )
+
+        assert prompt == "fb"
+        assert msgs == [{"role": "user", "content": "a"}]
+        assert requested_waits == pytest.approx([0.05], abs=0.001)
         _drain_admission_slots()
 
 
