@@ -540,7 +540,9 @@ def collect_compression_routes(config: dict | None) -> list[dict]:
         "primary",
         default_provider=main_provider,
     )
-    if not primary["model"]:
+    if primary["provider"] == "auto" and main_provider != "auto":
+        primary["provider"] = main_provider
+    if not primary["model"] and primary["provider"] == main_provider:
         primary["model"] = main_model
     routes = [primary]
 

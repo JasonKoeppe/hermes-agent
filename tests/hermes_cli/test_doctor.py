@@ -66,6 +66,42 @@ class TestProviderEnvDetection:
 
 
 class TestCompressionRouteHealth:
+    def test_resolves_auto_primary_to_main_provider(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "auto",
+                    "model": "",
+                },
+            },
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+
+        assert routes[0]["source"] == "primary"
+        assert routes[0]["provider"] == "openai-codex"
+        assert routes[0]["model"] == "gpt-5.6-sol"
+
+    def test_explicit_primary_without_model_uses_provider_default(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "anthropic",
+                    "model": "",
+                },
+            },
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+
+        assert routes[0]["provider"] == "anthropic"
+        assert routes[0]["model"] == ""
+        assert doctor._compression_route_label(routes[0]).endswith(
+            "anthropic/default"
+        )
+
     def test_collects_primary_task_and_global_fallbacks_in_runtime_order(self):
         cfg = {
             "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
