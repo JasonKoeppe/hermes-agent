@@ -3298,6 +3298,17 @@ class ContextCompressor(ContextEngine):
         """
         try:
             self._pending_request_rough_tokens = max(0, int(rough_tokens))
+            if (
+                self.awaiting_real_usage_after_compression
+                and self._pending_request_rough_tokens > 0
+            ):
+                # A completed compaction records an internal rough estimate, but
+                # the rebuilt API request can add fixed system/tool/plugin
+                # overhead. Refresh the post-compaction anchor with the exact
+                # request-pressure estimate that will be paired with provider
+                # usage. Stale pre-compaction notes cannot enter this branch
+                # because the awaiting flag is armed only after the rewrite.
+                self.last_compression_rough_tokens = self._pending_request_rough_tokens
         except (TypeError, ValueError):
             self._pending_request_rough_tokens = 0
 

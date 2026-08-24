@@ -292,6 +292,21 @@ class TestUpdateFromResponse:
 
         assert compressor.last_rough_tokens_when_real_prompt_fit == 40_000
 
+    def test_post_compression_request_note_refreshes_assembled_baseline(self, compressor):
+        """The first fully assembled request after compaction is a better rough
+        anchor than the compressor's internal estimate. Otherwise fixed request
+        overhead can make harmless tool growth look large enough to immediately
+        trigger another compaction."""
+        compressor.threshold_tokens = 200_000
+        compressor.last_compression_rough_tokens = 199_165
+        compressor.awaiting_real_usage_after_compression = True
+
+        compressor.note_request_rough_estimate(228_620)
+        compressor.update_from_response({"prompt_tokens": 156_996})
+
+        assert compressor.last_rough_tokens_when_real_prompt_fit == 228_620
+        assert compressor.should_defer_preflight_to_real_usage(244_734) is True
+
     def test_usage_less_response_preserves_pending_note(self, compressor):
         """Transports that report usage separately send usage-less responses
         first; the pending pair must survive until real usage arrives."""
