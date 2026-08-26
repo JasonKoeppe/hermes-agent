@@ -706,6 +706,26 @@ class TestAnthropicOAuthFlag:
         assert model == "claude-haiku-4-5-20251001"
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
+    def test_empty_pool_entry_falls_back_to_standalone_token(self):
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, {})),
+            patch(
+                "agent.anthropic_adapter.resolve_anthropic_token",
+                return_value="standalone-api-key",
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(),
+            ) as mock_build,
+        ):
+            from agent.auxiliary_client import _try_anthropic
+
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model == "claude-haiku-4-5-20251001"
+        assert mock_build.call_args.args[0] == "standalone-api-key"
+
 
 class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
@@ -1848,6 +1868,47 @@ class TestAuxiliaryFallbackLayering:
             "ollama-cloud",
             reason="provider unavailable",
         )
+
+    def test_explicit_compression_timeout_never_uses_global_fallback_chain(self):
+        """Global fallbacks are an auto-routing policy, not an explicit-route escape hatch."""
+        primary_client = SimpleNamespace(
+            base_url="",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=MagicMock())),
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("anthropic", "claude-primary", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "claude-primary"),
+            ),
+            patch(
+                "agent.auxiliary_client._relay_sync_completion",
+                side_effect=TimeoutError("synthetic compression timeout"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ) as task_chain,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ) as main_agent_chain,
+            patch("agent.auxiliary_client._try_main_fallback_chain") as global_chain,
+            patch("agent.auxiliary_client._evict_cached_client_instance"),
+        ):
+            with pytest.raises(TimeoutError, match="synthetic compression timeout"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        task_chain.assert_called_once()
+        main_agent_chain.assert_called_once()
+        global_chain.assert_not_called()
 
 
     def test_fallback_entry_openai_codex_uses_oauth_pool_without_inline_key(self):
@@ -3171,10 +3232,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        emitted = []
+
         class _SlowAliveCreateStream:
             def __iter__(self):
                 for _ in range(5):
                     time.sleep(0.03)
+                    emitted.append(1)
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3186,14 +3250,95 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # The deadline must interrupt a stream that continues producing
+        # liveness events; host wall-clock return latency also includes cold
+        # imports, scheduler pauses, and cleanup and is not a valid unit-test
+        # contract under machine load.
+        assert len(emitted) < 5
+
+
+class TestCompressionConfiguredFallback:
+    def test_stalled_primary_returns_real_summary_without_mutating_source(self):
+        """A compression timeout must reach the configured viable route.
+
+        The auxiliary layer is not allowed to consume, rewrite, or drop the
+        source transcript while changing routes.  Transcript replacement is a
+        later compressor commit step and may happen only after this call has
+        returned a real summary.
+        """
+        source_messages = [
+            {"role": "user", "content": "keep this request"},
+            {"role": "assistant", "content": "keep this progress"},
+        ]
+        source_snapshot = [dict(message) for message in source_messages]
+        primary = MagicMock(name="stalled_codex")
+        primary.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback = MagicMock(name="healthy_anthropic")
+        fallback.base_url = "https://api.anthropic.com/v1"
+        summary = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="## Active Task\nContinue the preserved request."
+            ))]
+        )
+
+        def fake_relay(client, request, **_kwargs):
+            if client is primary:
+                raise TimeoutError("primary compression stream stalled")
+            assert client is fallback
+            return summary
+
+        route_info = {}
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "openai-codex", "gpt-5.6-sol", None, None,
+                    "codex_responses",
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary, "gpt-5.6-sol"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback, "claude-opus-4-8",
+                    "fallback_chain[0](anthropic)",
+                ),
+            ) as configured_fallback,
+            patch(
+                "agent.auxiliary_client._relay_sync_completion",
+                side_effect=fake_relay,
+            ),
+            patch("agent.auxiliary_client._evict_cached_client_instance"),
+        ):
+            response = call_llm(
+                task="compression",
+                messages=source_messages,
+                route_info=route_info,
+            )
+
+        assert response.choices[0].message.content.startswith("## Active Task")
+        assert route_info == {
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+        }
+        configured_fallback.assert_called_once_with(
+            "compression",
+            "openai-codex",
+            reason="connection error",
+            failed_model="gpt-5.6-sol",
+        )
+        assert source_messages == source_snapshot
+        assert source_messages[0]["content"] == "keep this request"
+        assert source_messages[1]["content"] == "keep this progress"
 
 
 class TestCodexAuxiliaryAdapterCacheScope:

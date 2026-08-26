@@ -65,6 +65,173 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+class TestCompressionRouteHealth:
+    def test_resolves_auto_primary_to_main_provider(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "auto",
+                    "model": "",
+                },
+            },
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+
+        assert routes[0]["source"] == "primary"
+        assert routes[0]["provider"] == "openai-codex"
+        assert routes[0]["model"] == "gpt-5.6-sol"
+
+    def test_explicit_primary_without_model_uses_provider_default(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "anthropic",
+                    "model": "",
+                },
+            },
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+
+        assert routes[0]["provider"] == "anthropic"
+        assert routes[0]["model"] == ""
+        assert doctor._compression_route_label(routes[0]).endswith(
+            "anthropic/default"
+        )
+
+    def test_auto_primary_collects_task_and_global_fallbacks_in_runtime_order(self):
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "auto",
+                    "model": "",
+                    "fallback_chain": [
+                        {"provider": "anthropic", "model": "claude-opus-4-8"},
+                    ],
+                },
+            },
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+            ],
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+
+        assert [(route["source"], route["provider"], route["model"]) for route in routes] == [
+            ("primary", "openai-codex", "gpt-5.6-sol"),
+            ("task fallback 1", "anthropic", "claude-opus-4-8"),
+            ("global fallback 1", "openrouter", "anthropic/claude-opus-4.8"),
+        ]
+
+    def test_explicit_primary_does_not_certify_unreachable_global_fallback(self):
+        """Explicit auxiliary routes do not use the global fallback chain."""
+        cfg = {
+            "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+            "auxiliary": {
+                "compression": {
+                    "provider": "anthropic",
+                    "model": "claude-fable-5",
+                    "fallback_chain": [
+                        {"provider": "anthropic", "model": "claude-opus-4-8"},
+                    ],
+                },
+            },
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+            ],
+        }
+
+        routes = doctor.collect_compression_routes(cfg)
+        health = doctor.evaluate_compression_route_health(
+            routes,
+            credential_available=lambda route: route["source"] == "global fallback 1",
+        )
+
+        assert [(route["source"], route["provider"], route["model"]) for route in routes] == [
+            ("primary", "anthropic", "claude-fable-5"),
+            ("task fallback 1", "anthropic", "claude-opus-4-8"),
+        ]
+        assert health["usable"] is False
+
+    def test_health_is_usable_when_any_route_has_local_credentials(self):
+        routes = [
+            {"source": "primary", "provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"source": "task fallback 1", "provider": "anthropic", "model": "claude-opus-4-8"},
+        ]
+
+        health = doctor.evaluate_compression_route_health(
+            routes,
+            credential_available=lambda route: route["provider"] == "anthropic",
+        )
+
+        assert health["usable"] is True
+        assert health["usable_routes"] == [routes[1]]
+        assert health["unusable_routes"] == [routes[0]]
+
+    def test_health_warns_without_exposing_route_secrets(self):
+        routes = [{
+            "source": "primary",
+            "provider": "anthropic",
+            "model": "claude-fable-5",
+            "api_key": "must-not-appear",
+        }]
+
+        health = doctor.evaluate_compression_route_health(
+            routes,
+            credential_available=lambda _route: False,
+        )
+
+        assert health["usable"] is False
+        rendered = doctor.format_compression_route_health(health)
+        assert "no locally resolvable credentials" in rendered.lower()
+        assert "anthropic/claude-fable-5" in rendered
+        assert "must-not-appear" not in rendered
+
+    def test_primary_key_env_is_locally_resolvable_without_rendering_secret(self, monkeypatch):
+        monkeypatch.setenv("DOCTOR_PRIMARY_KEY", "primary-route-secret")
+        route = {
+            "source": "primary",
+            "provider": "custom",
+            "model": "local-primary",
+            "key_env": "DOCTOR_PRIMARY_KEY",
+        }
+
+        health = doctor.evaluate_compression_route_health(
+            [route], credential_available=doctor.compression_route_has_local_credentials,
+        )
+        rendered = doctor.format_compression_route_health(health)
+
+        assert health["usable"] is True
+        assert "primary-route-secret" not in rendered
+
+    def test_fallback_api_key_env_uses_active_profile_scope_without_rendering_secret(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+        monkeypatch.setenv("DOCTOR_FALLBACK_KEY", "other-profile-secret")
+        route = {
+            "source": "task fallback 1",
+            "provider": "custom",
+            "model": "local-fallback",
+            "api_key_env": "DOCTOR_FALLBACK_KEY",
+        }
+        token = set_secret_scope({"DOCTOR_FALLBACK_KEY": "active-profile-secret"})
+        try:
+            health = doctor.evaluate_compression_route_health(
+                [route], credential_available=doctor.compression_route_has_local_credentials,
+            )
+        finally:
+            reset_secret_scope(token)
+        rendered = doctor.format_compression_route_health(health)
+
+        assert health["usable"] is True
+        assert "active-profile-secret" not in rendered
+        assert "other-profile-secret" not in rendered
+
+
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):
         unavailable = [

@@ -3903,6 +3903,11 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     pool_present, entry = _select_pool_entry("anthropic")
     if pool_present and entry is not None:
         token = explicit_api_key or _pool_runtime_api_key(entry)
+        if not token:
+            # A pool can report a selected placeholder entry that carries no
+            # runtime credential. Do not let it mask a valid standalone token.
+            entry = None
+            token = explicit_api_key or resolve_anthropic_token()
     else:
         # Pool absent, OR pool present but no usable entry (expired token +
         # stale refresh_token, all entries exhausted, etc). Fall through to the
