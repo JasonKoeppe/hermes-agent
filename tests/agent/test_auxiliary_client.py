@@ -1869,6 +1869,47 @@ class TestAuxiliaryFallbackLayering:
             reason="provider unavailable",
         )
 
+    def test_explicit_compression_timeout_never_uses_global_fallback_chain(self):
+        """Global fallbacks are an auto-routing policy, not an explicit-route escape hatch."""
+        primary_client = SimpleNamespace(
+            base_url="",
+            chat=SimpleNamespace(completions=SimpleNamespace(create=MagicMock())),
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("anthropic", "claude-primary", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "claude-primary"),
+            ),
+            patch(
+                "agent.auxiliary_client._relay_sync_completion",
+                side_effect=TimeoutError("synthetic compression timeout"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ) as task_chain,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ) as main_agent_chain,
+            patch("agent.auxiliary_client._try_main_fallback_chain") as global_chain,
+            patch("agent.auxiliary_client._evict_cached_client_instance"),
+        ):
+            with pytest.raises(TimeoutError, match="synthetic compression timeout"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        task_chain.assert_called_once()
+        main_agent_chain.assert_called_once()
+        global_chain.assert_not_called()
+
 
     def test_fallback_entry_openai_codex_uses_oauth_pool_without_inline_key(self):
         """Configured Codex fallback resolves through Hermes auth / credential pool."""

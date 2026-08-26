@@ -524,6 +524,13 @@ def collect_compression_routes(config: dict | None) -> list[dict]:
     auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
     compression = auxiliary.get("compression")
     compression = compression if isinstance(compression, dict) else {}
+    primary_configured_provider = str(compression.get("provider") or "").strip()
+    # ``_resolve_task_provider_model`` treats an omitted provider and the
+    # lowercase ``auto`` sentinel as auto routing. Only that runtime policy
+    # reaches the top-level fallback chain.
+    primary_uses_auto_route = (
+        not primary_configured_provider or primary_configured_provider == "auto"
+    )
 
     def _route(entry: dict, source: str, *, default_provider: str = "") -> dict:
         route = dict(entry)
@@ -552,10 +559,11 @@ def collect_compression_routes(config: dict | None) -> list[dict]:
             if isinstance(entry, dict) and str(entry.get("provider") or "").strip():
                 routes.append(_route(entry, f"task fallback {index}"))
 
-    from hermes_cli.fallback_config import get_fallback_chain
+    if primary_uses_auto_route:
+        from hermes_cli.fallback_config import get_fallback_chain
 
-    for index, entry in enumerate(get_fallback_chain(config), 1):
-        routes.append(_route(entry, f"global fallback {index}"))
+        for index, entry in enumerate(get_fallback_chain(config), 1):
+            routes.append(_route(entry, f"global fallback {index}"))
 
     return routes
 
@@ -598,8 +606,18 @@ def format_compression_route_health(health: dict) -> str:
 
 def compression_route_has_local_credentials(route: dict) -> bool:
     """Return whether a route can resolve credentials without an API call."""
-    if str(route.get("api_key") or "").strip():
-        return True
+    try:
+        # Match the secret-scope-aware resolver used by the auxiliary runtime.
+        # This covers inline keys plus ``key_env`` and ``api_key_env`` without
+        # rendering a resolved value into doctor output.
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        if resolve_entry_api_key(route):
+            return True
+    except Exception:
+        # In particular, an unscoped read while profile multiplexing is active
+        # must remain a fail-closed diagnostic result.
+        return False
     provider = str(route.get("provider") or "auto").strip().lower()
     if provider == "openai-codex":
         from agent.auxiliary_client import _read_codex_access_token
