@@ -1529,6 +1529,78 @@ class TestReconnection:
 
         asyncio.run(_test())
 
+    def test_failed_start_reaps_parked_task_and_transport_fds(self):
+        """A raising start() must not leave an immortal parked run() task.
+
+        Regression test for the 2026-07-24 fd-exhaustion outage: start()
+        raised on initial-connect failure while run() parked with a timed
+        self-probe. The instance was never stored in _servers, so each
+        discovery pass against a down server minted one unreachable parked
+        task — and once the server recovered, every orphan's next probe
+        opened a live stdio transport (child + pipe fds) that nothing could
+        ever close.
+        """
+        import os
+        from tools.mcp_tool import MCPServerTask
+
+        real_sleep = asyncio.sleep
+        healthy = False
+        run_calls = []
+        open_pipes = []  # (r, w) fds currently held by a fake transport
+
+        original_run_stdio = MCPServerTask._run_stdio
+
+        async def fake_run_stdio(self_srv, config):
+            if self_srv.name != "flaky":
+                return await original_run_stdio(self_srv, config)
+            run_calls.append(1)
+            # Real os.pipe() fds stand in for the stdio transport's pipes so
+            # fd-flatness is measured, not assumed.
+            r, w = os.pipe()
+            open_pipes.append((r, w))
+            try:
+                if not healthy:
+                    raise ConnectionError("server down")
+                self_srv.session = MagicMock()
+                self_srv._ready.set()
+                await self_srv._shutdown_event.wait()
+            finally:
+                os.close(r)
+                os.close(w)
+                open_pipes.remove((r, w))
+                self_srv.session = None
+
+        async def _test():
+            nonlocal healthy
+            with patch.object(MCPServerTask, "_run_stdio", fake_run_stdio), \
+                 patch("tools.mcp_tool._PARKED_RETRY_INTERVAL", 0.05), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                # Two sequential discovery passes against a down server (the
+                # cron-driven discover_mcp_tools() pattern).
+                tasks = []
+                for _ in range(2):
+                    server = MCPServerTask("flaky")
+                    with pytest.raises(ConnectionError, match="server down"):
+                        await server.start({"command": "test"})
+                    tasks.append(server._task)
+
+                assert all(t.done() for t in tasks), \
+                    "failed start() left an orphaned parked run() task"
+                assert open_pipes == [], \
+                    "failed connect attempts left transport fds open"
+
+                # The underlying server recovers. No orphan may exist to
+                # revive against it: wait out several parked self-probe
+                # intervals and verify nothing reconnects or pins fds.
+                healthy = True
+                calls_after_failures = len(run_calls)
+                await real_sleep(0.3)
+                assert len(run_calls) == calls_after_failures, \
+                    "an orphaned parked task revived and opened a transport"
+                assert open_pipes == []
+
+        asyncio.run(_test())
+
 # ---------------------------------------------------------------------------
 # Configurable timeouts
 # ---------------------------------------------------------------------------

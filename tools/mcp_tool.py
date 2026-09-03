@@ -4407,7 +4407,23 @@ class MCPServerTask:
                 self._task.cancel()
             raise
         if self._error:
-            raise self._error
+            # Initial connect failed and we're about to raise, so the caller
+            # (_discover_and_register_server) never stores this instance in
+            # _servers — after the raise nothing (not shutdown_mcp_servers,
+            # not _signal_reconnect, not the stale-cached wake in
+            # register_mcp_servers) can ever reach it again. But run() does
+            # not exit on initial-connect failure: it parks with a timed
+            # self-probe (_PARKED_RETRY_INTERVAL), so left alone the task is
+            # immortal, and if the underlying server later recovers, its next
+            # probe opens a live transport (child process + stdio pipe fds)
+            # with no registered tools and no owner able to close it. Every
+            # discovery pass against a persistently failing server minted one
+            # such orphan, ratcheting the gateway to fd exhaustion (2026-07-24
+            # outage). Reap the task before re-raising so a failed connect
+            # attempt fully unwinds its resources.
+            error = self._error
+            await self.shutdown()
+            raise error
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
