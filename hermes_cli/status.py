@@ -129,6 +129,94 @@ def _estop_status_line():
     return f"⏸️  PAUSED (global emergency stop{suffix}; `hermes resume` to lift)"
 
 
+
+def _last_observed_model_by_source() -> dict:
+    """Most recent model actually used per surface, from state.db.
+
+    Config says what *should* run; a chat-level /model override says what
+    *does*. Surfaces disagreeing silently is the defect this reports on, so
+    read the live answer rather than infer it.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    out: dict = {}
+    db = Path(get_hermes_home()) / "state.db"
+    if not db.exists():
+        return out
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2.0)
+        try:
+            cur = con.execute(
+                "SELECT source, model, MAX(started_at) FROM sessions "
+                "WHERE model IS NOT NULL AND model != '' "
+                "AND started_at > strftime('%s','now') - 7*86400 "
+                "GROUP BY source"
+            )
+            for source, model, _ts in cur.fetchall():
+                if source:
+                    out[str(source)] = str(model)
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    return out
+
+
+def _print_model_routing(config: dict) -> None:
+    """Show the effective model per surface, not just the global default.
+
+    Telegram can carry a chat-level override, cron pins its own model, and
+    ledger workers take theirs per task, so a single "Model:" line hides
+    real divergence between front door, crons and workers.
+    """
+    def _sub(section: str, key: str, default: str = "") -> str:
+        """Read config[section][key] tolerantly.
+
+        A section can legitimately be a scalar (or absent) depending on how the
+        config was written, so never assume a mapping.
+        """
+        if not isinstance(config, dict):
+            return default
+        node = config.get(section)
+        if not isinstance(node, dict):
+            return default
+        value = node.get(key)
+        return str(value) if value else default
+
+    live = _last_observed_model_by_source()
+    default_model = _sub("model", "default", "?")
+    cron_model = _sub("cron", "model")
+    deleg_model = _sub("delegation", "model")
+
+    rows = [
+        ("Default (config)", default_model, "model.default"),
+        ("Telegram", live.get("telegram") or default_model,
+         "chat override" if live.get("telegram") and live.get("telegram") != default_model else "inherits default"),
+        ("Desktop / HDA", live.get("desktop") or default_model,
+         "observed" if live.get("desktop") else "inherits default"),
+        ("CLI", live.get("cli") or default_model,
+         "observed" if live.get("cli") else "inherits default"),
+        ("Cron", cron_model or live.get("cron") or default_model,
+         "cron.model" if cron_model else "inherits default"),
+        ("Delegation / subagents", deleg_model or live.get("subagent") or default_model,
+         "delegation.model" if deleg_model
+         else ("observed" if live.get("subagent") else "inherits default")),
+        ("Ledger workers", "per task (ledger_tasks.model)", "set at dispatch"),
+    ]
+
+    print()
+    print(color("\u25c6 Model routing by surface", Colors.CYAN, Colors.BOLD))
+    width = max(len(r[0]) for r in rows) + 2
+    for label, model, note in rows:
+        divergent = (
+            model
+            and model != default_model
+            and not str(model).startswith("per task")
+        )
+        shown = color(str(model), Colors.YELLOW) if divergent else str(model)
+        print(f"  {label:<{width}}{shown}  ({note})")
+
 def show_status(args):
     """Show status of all Hermes Agent components."""
     deep = getattr(args, 'deep', False)
@@ -161,6 +249,12 @@ def show_status(args):
 
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
+
+    try:
+        _print_model_routing(config)
+    except Exception:
+        # Diagnostics must never break `hermes status`.
+        pass
 
     # =========================================================================
     # API Keys

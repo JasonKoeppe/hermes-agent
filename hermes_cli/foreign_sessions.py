@@ -317,7 +317,33 @@ _SOURCE_LABELS = {"claude": "Claude Code", "codex": "Codex CLI"}
 _SOURCE_DB_NAMES = {"claude": "claude-code", "codex": "codex-cli"}
 
 
-def import_foreign_session(source: str, path, db=None) -> str:
+
+# A ledger worker's first user turn is its dispatch preamble. Continuing such a
+# session from the desktop/Telegram agent turns a detached, budgeted task into
+# an interactive one: on 2026-09-04 session 20260904_162527_e210ea did code
+# edits, a merge, a production deploy and a client email inline before hitting
+# agent.max_turns and run_budget_seconds. Imported history is reference
+# material, not a live thread — mark it so and let the caller opt out.
+LEDGER_WORKER_PREAMBLE_MARKERS = (
+    "You are a detached worker for ledger task",
+    "detached worker for ledger task",
+)
+
+
+def looks_like_ledger_worker_transcript(turns) -> bool:
+    """True when the first user turn is a ledger worker dispatch preamble."""
+    for turn in turns or []:
+        role = turn.get("role") if isinstance(turn, dict) else None
+        if role != "user":
+            continue
+        content = turn.get("content") if isinstance(turn, dict) else ""
+        text = content if isinstance(content, str) else ""
+        head = text.lstrip()[:400]
+        return any(marker in head for marker in LEDGER_WORKER_PREAMBLE_MARKERS)
+    return False
+
+
+def import_foreign_session(source: str, path, db=None, *, allow_continue: bool = False) -> str:
     """Import one foreign session into the Hermes SessionDB.
 
     Returns the new Hermes session id.  The foreign file is only read.
@@ -359,6 +385,7 @@ def import_foreign_session(source: str, path, db=None) -> str:
         session_id = (
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         )
+        is_worker_transcript = looks_like_ledger_worker_transcript(turns)
         origin = {
             "imported_from": {
                 "tool": _SOURCE_DB_NAMES[source],
@@ -366,6 +393,18 @@ def import_foreign_session(source: str, path, db=None) -> str:
                 "foreign_session_id": parsed.get("session_id"),
             }
         }
+        # Imported history is reference material by default. Continuing it
+        # inline is how a detached worker's transcript became an interactive
+        # session that deployed to production (2026-09-04 hardening brief #2).
+        if not allow_continue:
+            origin["read_only"] = True
+            origin["read_only_reason"] = (
+                "ledger-worker transcript; dispatch a new ledger task instead"
+                if is_worker_transcript
+                else "imported session; clone it explicitly to continue"
+            )
+        if is_worker_transcript:
+            origin["ledger_worker_transcript"] = True
         db.create_session(
             session_id,
             source=_SOURCE_DB_NAMES[source],
