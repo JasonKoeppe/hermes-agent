@@ -756,6 +756,14 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
+        from agent.anthropic_credentials import claude_subscription_oauth_denied
+
+        if claude_subscription_oauth_denied():
+            raise ValueError(
+                "Claude subscription OAuth tokens are disabled for this Hermes "
+                "install (HERMES_DENY_CLAUDE_SUBSCRIPTION_OAUTH). Use an "
+                "Anthropic API key."
+            )
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
         # without Claude Code's fingerprint, requests get intermittent 500s.

@@ -2461,6 +2461,12 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
     """
     if not api_key or api_key.startswith("sk-ant-oat"):
         return None  # OAuth tokens can't access /v1/models
+    from agent.anthropic_credentials import (
+        _is_oauth_token as _is_anthropic_oauth_token,
+        claude_subscription_oauth_denied,
+    )
+    if _is_anthropic_oauth_token(api_key) and claude_subscription_oauth_denied():
+        return None
     try:
         base = base_url.rstrip("/")
         if base.endswith("/v1"):

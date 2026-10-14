@@ -53,6 +53,54 @@ def _getenv(name: str, default: str = "") -> str:
     return val if val is not None else default
 
 
+CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV = "HERMES_DENY_CLAUDE_SUBSCRIPTION_OAUTH"
+
+
+def claude_subscription_oauth_denied() -> bool:
+    """Return True when this install refuses Claude subscription OAuth outright.
+
+    Anthropic limits Claude Pro/Max subscription logins (setup-tokens,
+    Claude Code keychain/credential-file logins, Hermes PKCE logins) to its
+    own apps. When ``HERMES_DENY_CLAUDE_SUBSCRIPTION_OAUTH`` is truthy in the
+    process environment or ``~/.hermes/.env``, Hermes never resolves, seeds
+    or sends such a token and uses Anthropic API keys only. Default: off,
+    which keeps upstream behavior.
+    """
+    truthy = {"1", "true", "yes", "on"}
+    if str(os.environ.get(CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV) or "").strip().lower() in truthy:
+        return True
+    try:
+        from hermes_cli.config import load_env
+
+        raw = (load_env() or {}).get(CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV)
+    except Exception:
+        raw = None
+    if str(raw or "").strip().lower() in truthy:
+        return True
+    # Profiles read <root>/profiles/<name>/.env; the root .env policy still applies.
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_env = get_default_hermes_root() / ".env"
+        for line in root_env.read_text(encoding="utf-8-sig").splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.strip().removeprefix("export ").strip() == CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV:
+                if value.strip().strip("'\"").lower() in truthy:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _subscription_oauth_refused(action: str) -> bool:
+    """Log and report a refused subscription-OAuth action when the switch is on."""
+    if claude_subscription_oauth_denied():
+        logger.info("Claude subscription OAuth refused (%s): %s is set",
+                    action, CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV)
+        return True
+    return False
+
+
 def _is_oauth_token(key: str) -> bool:
     """Check if the key is an Anthropic OAuth/setup token.
 
@@ -381,6 +429,9 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    if _subscription_oauth_refused("read Claude Code credentials"):
+        return None
+
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
@@ -417,6 +468,10 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
 
 def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
     """Refresh an Anthropic OAuth token without mutating local credential files."""
+    if _subscription_oauth_refused("refresh"):
+        raise ValueError("Claude subscription OAuth refresh is disabled ("
+                         + CLAUDE_SUBSCRIPTION_OAUTH_DENY_ENV + ")")
+
     import time
     import urllib.parse
     import urllib.request
@@ -493,6 +548,9 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     has already produced a valid token, adopt it and skip the POST entirely.
     Only fall back to refreshing ourselves when no fresh credential is found.
     """
+    if _subscription_oauth_refused("refresh"):
+        return None
+
     # Claude Code may have already refreshed — adopt its token rather than
     # racing it with our (possibly already-rotated) refresh token. The read,
     # decision, POST, and write-back all belong to the shared credentials
@@ -799,6 +857,15 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
+    if claude_subscription_oauth_denied():
+        # Only regular API keys. Never env setup-tokens, Claude Code
+        # credentials (keychain or file) or pool OAuth entries.
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN"):
+            candidate = _getenv(name).strip()
+            if candidate and not _is_oauth_token(candidate):
+                return candidate
+        return None
+
     creds: Optional[Dict[str, Any]] = None
     creds_loaded = False
 
@@ -854,6 +921,9 @@ def run_oauth_setup_token() -> Optional[str]:
     Returns the token string, or None if no credentials were obtained.
     Raises FileNotFoundError if the 'claude' CLI is not installed.
     """
+    if _subscription_oauth_refused("setup-token login"):
+        return None
+
     import shutil
     import subprocess
 
@@ -932,6 +1002,9 @@ def _generate_pkce() -> tuple:
 
 def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
     """Run Hermes-native OAuth PKCE flow and return credential state."""
+    if _subscription_oauth_refused("PKCE login"):
+        return None
+
     import secrets
     import time
     import webbrowser
@@ -1062,6 +1135,8 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
 
 def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
     """Read Hermes-managed OAuth credentials from ~/.hermes/.anthropic_oauth.json."""
+    if _subscription_oauth_refused("read Hermes OAuth credentials"):
+        return None
     oauth_file = _get_hermes_oauth_file()
     if oauth_file.exists():
         try:

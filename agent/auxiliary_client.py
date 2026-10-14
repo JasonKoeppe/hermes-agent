@@ -4167,6 +4167,11 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
+    if is_oauth:
+        from agent.anthropic_credentials import claude_subscription_oauth_denied
+
+        if claude_subscription_oauth_denied():
+            return None, None
     model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     if _aux_probe_active():
         # Availability probe — token + SDK adapter import resolved; skip

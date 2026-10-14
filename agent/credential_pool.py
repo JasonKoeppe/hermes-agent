@@ -2907,6 +2907,20 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # that masquerade.  Prefer ~/.hermes/.env over os.environ for the
         # same reason `_seed_from_env` does — that's the authoritative file
         # that `hermes setup` writes.
+        from agent.anthropic_credentials import claude_subscription_oauth_denied
+
+        if claude_subscription_oauth_denied():
+            # Subscription OAuth refused outright: drop any autodiscovered
+            # Claude Code / Hermes PKCE entries and seed nothing new.
+            retained = [
+                entry for entry in entries
+                if entry.source not in {"hermes_pkce", "claude_code"}
+            ]
+            if len(retained) != len(entries):
+                entries[:] = retained
+                changed = True
+            return changed, active_sources
+
         _env_file = load_env()
 
         def _env_val(key: str) -> str:
@@ -3357,17 +3371,28 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
+    deny_subscription_oauth = False
     if provider == "anthropic":
         env_vars = [
             "ANTHROPIC_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_API_KEY",
         ]
+        from agent.anthropic_credentials import (
+            _is_oauth_token as _is_anthropic_oauth_token,
+            claude_subscription_oauth_denied,
+        )
+
+        deny_subscription_oauth = claude_subscription_oauth_denied()
 
     for env_var in env_vars:
         # Prefer ~/.hermes/.env over os.environ
         token = _get_env_prefer_dotenv(env_var)
         if not token:
+            continue
+        if deny_subscription_oauth and (
+            env_var == "CLAUDE_CODE_OAUTH_TOKEN" or _is_anthropic_oauth_token(token)
+        ):
             continue
         source = f"env:{env_var}"
         if _is_source_suppressed(provider, source):
@@ -3555,6 +3580,25 @@ def load_pool(provider: str) -> CredentialPool:
             prune_env_sources=False,
         )
         changed |= _normalize_pool_priorities(provider, entries)
+
+    if provider == "anthropic":
+        from agent.anthropic_credentials import (
+            _is_oauth_token as _is_anthropic_oauth_token,
+            claude_subscription_oauth_denied,
+        )
+
+        if claude_subscription_oauth_denied():
+            # Subscription OAuth refused outright: drop stored OAuth entries
+            # (manual, env-seeded or autodiscovered) so they can never be
+            # selected or refreshed. API-key entries are untouched.
+            retained = [
+                entry for entry in entries
+                if entry.auth_type != AUTH_TYPE_OAUTH
+                and not _is_anthropic_oauth_token(entry.access_token or "")
+            ]
+            if len(retained) != len(entries):
+                entries[:] = retained
+                changed = True
 
     if changed:
         new_ids = {entry.id for entry in entries}

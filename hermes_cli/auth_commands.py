@@ -287,6 +287,17 @@ def auth_add_command(args) -> None:
             token = masked_secret_prompt("Paste your API key: ").strip()
         if not token:
             raise SystemExit("No API key provided.")
+        if provider == "anthropic":
+            from agent.anthropic_credentials import (
+                _is_oauth_token,
+                claude_subscription_oauth_denied,
+            )
+
+            if _is_oauth_token(token) and claude_subscription_oauth_denied():
+                raise SystemExit(
+                    "That is a Claude subscription token, not an API key. "
+                    "Claude subscription login is disabled on this install."
+                )
         default_label = _api_key_default_label(len(pool.entries()) + 1)
         label = (getattr(args, "label", None) or "").strip()
         if not label:

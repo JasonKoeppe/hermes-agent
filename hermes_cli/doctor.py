@@ -2812,6 +2812,12 @@ def run_doctor(args):
         key = get_anthropic_key()
         if not key:
             return _ConnectivityResult("Anthropic API", [], [])
+        from agent.anthropic_credentials import (
+            _is_oauth_token as _is_anthropic_oauth_token,
+            claude_subscription_oauth_denied,
+        )
+        if _is_anthropic_oauth_token(key) and claude_subscription_oauth_denied():
+            return _ConnectivityResult("Anthropic API", [], [])
         try:
             import httpx
             from agent.anthropic_adapter import (

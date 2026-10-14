@@ -4715,12 +4715,22 @@ def _fetch_anthropic_models(
 
     resolved_base_url = base_url
     token = (api_key or "").strip() or resolve_anthropic_token()
+    if token and _is_oauth_token(token):
+        from agent.anthropic_credentials import claude_subscription_oauth_denied
+
+        if claude_subscription_oauth_denied():
+            token = resolve_anthropic_token()
     if not token:
         # A pool credential and its endpoint are one security boundary. Never
         # pair the selected pool key with a caller-provided model endpoint.
         token, resolved_base_url = _resolve_anthropic_pool_catalog_credentials()
     if not token:
         return None
+    if _is_oauth_token(token):
+        from agent.anthropic_credentials import claude_subscription_oauth_denied
+
+        if claude_subscription_oauth_denied():
+            return None
 
     headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
     is_oauth = _is_oauth_token(token)
